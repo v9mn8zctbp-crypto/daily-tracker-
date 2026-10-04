@@ -1,0 +1,476 @@
+"""
+============================================================
+Трекер ежедневных дел (Daily Tasks Tracker) — полноэкранная версия
+============================================================
+
+Полноэкранное приложение с графическим интерфейсом для
+отслеживания ежедневных дел + календарь активности в стиле
+GitHub (квадратики за месяц, окрашенные по проценту выполнения
+дел за день).
+
+Возможности:
+    - Полноэкранный режим (Esc — выйти в окно, F11 — переключить обратно)
+    - Слева: список дел на сегодня (добавление / удаление / чекбоксы)
+    - Справа: календарь-heatmap на месяц (как активность на GitHub)
+      + переключение между месяцами стрелками
+    - Кнопка "Новый день" — сбрасывает галочки, список дел сохраняется
+    - Автоматический перенос на новый день: если приложение открыли
+      на следующий день, вчерашний результат сам сохранится в историю,
+      а галочки на сегодня очистятся
+    - Все данные (список дел + история по дням) хранятся в JSON-файле
+      рядом со скриптом и подгружаются при следующем запуске
+
+Установка зависимостей (один раз):
+    pip install customtkinter
+
+Запуск:
+    python daily_tracker.py
+============================================================
+"""
+
+import json
+import os
+import uuid
+import calendar
+from datetime import date
+import customtkinter as ctk
+from tkinter import messagebox
+
+# ------------------------------------------------------------------
+# Константы
+# ------------------------------------------------------------------
+DATA_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tasks_data.json")
+
+DAY_NAMES = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
+MONTH_NAMES = [
+    "Январь", "Февраль", "Март", "Апрель", "Май", "Июнь",
+    "Июль", "Август", "Сентябрь", "Октябрь", "Ноябрь", "Декабрь"
+]
+
+# Цвета "квадратиков" календаря по проценту выполнения (в стиле GitHub)
+COLOR_NO_TASKS = "#2b2b2b"    # день без дел / будущий день
+COLOR_0 = "#33383e"           # 0% выполнено
+COLOR_25 = "#0e4429"          # до 25%
+COLOR_50 = "#006d32"          # до 50%
+COLOR_75 = "#26a641"          # до 75%
+COLOR_100 = "#39d353"         # больше 75% (и 100%)
+COLOR_TODAY_BORDER = "#e8b923"  # обводка для сегодняшнего дня
+
+ctk.set_appearance_mode("Dark")
+ctk.set_default_color_theme("blue")
+
+
+def ratio_to_color(done, total):
+    """Возвращает цвет квадратика по доле выполненных дел."""
+    if total == 0:
+        return COLOR_NO_TASKS
+    ratio = done / total
+    if ratio <= 0:
+        return COLOR_0
+    elif ratio <= 0.25:
+        return COLOR_25
+    elif ratio <= 0.5:
+        return COLOR_50
+    elif ratio <= 0.75:
+        return COLOR_75
+    else:
+        return COLOR_100
+
+
+class TaskRow(ctk.CTkFrame):
+    """Один ряд задачи: чекбокс с названием + кнопка удаления."""
+
+    def __init__(self, master, app, task_data):
+        super().__init__(master, fg_color="#2b2b2b", corner_radius=10)
+        self.app = app
+        self.task_id = task_data["id"]
+
+        self.check_var = ctk.BooleanVar(value=task_data.get("done", False))
+
+        self.checkbox = ctk.CTkCheckBox(
+            self,
+            text=task_data["name"],
+            variable=self.check_var,
+            command=self.on_toggle,
+            font=ctk.CTkFont(size=15),
+            checkbox_width=22,
+            checkbox_height=22,
+        )
+        self.checkbox.pack(side="left", padx=15, pady=10, fill="x", expand=True)
+
+        self.delete_btn = ctk.CTkButton(
+            self, text="✕", width=32, height=32,
+            fg_color="#8b2c2c", hover_color="#a83232",
+            command=self.on_delete,
+        )
+        self.delete_btn.pack(side="right", padx=10, pady=8)
+
+        self.update_style()
+
+    def on_toggle(self):
+        self.app.set_task_done(self.task_id, self.check_var.get())
+        self.update_style()
+
+    def on_delete(self):
+        if messagebox.askyesno("Удаление дела", f'Удалить дело "{self.checkbox.cget("text")}"?'):
+            self.app.delete_task(self.task_id)
+
+    def update_style(self):
+        self.checkbox.configure(
+            text_color="#6fcf97" if self.check_var.get() else "#ffffff"
+        )
+
+
+class DayCell(ctk.CTkFrame):
+    """Один квадратик календаря, соответствующий одному дню месяца."""
+
+    def __init__(self, master, day_number, color, is_today, tooltip_text):
+        border = COLOR_TODAY_BORDER if is_today else color
+        super().__init__(
+            master, width=52, height=52, corner_radius=8,
+            fg_color=color, border_width=2 if is_today else 0,
+            border_color=border,
+        )
+        self.grid_propagate(False)
+
+        if day_number is not None:
+            label = ctk.CTkLabel(
+                self, text=str(day_number),
+                font=ctk.CTkFont(size=12, weight="bold" if is_today else "normal"),
+                text_color="#ffffff",
+            )
+            label.place(relx=0.5, rely=0.5, anchor="center")
+
+            # Подсказка при наведении — показываем короткую сводку по клику
+            if tooltip_text:
+                for widget in (self, label):
+                    widget.bind("<Button-1>", lambda e: messagebox.showinfo("Статистика дня", tooltip_text))
+
+
+class CalendarView(ctk.CTkFrame):
+    """Панель с heatmap-календарём на месяц (аналог активности GitHub)."""
+
+    def __init__(self, master, app):
+        super().__init__(master, fg_color="#212121", corner_radius=14)
+        self.app = app
+
+        # --- Заголовок с переключением месяцев ---
+        header = ctk.CTkFrame(self, fg_color="transparent")
+        header.pack(fill="x", padx=15, pady=(15, 5))
+
+        prev_btn = ctk.CTkButton(header, text="◀", width=36, command=self.prev_month)
+        prev_btn.pack(side="left")
+
+        self.title_label = ctk.CTkLabel(
+            header, text="", font=ctk.CTkFont(size=20, weight="bold")
+        )
+        self.title_label.pack(side="left", expand=True)
+
+        next_btn = ctk.CTkButton(header, text="▶", width=36, command=self.next_month)
+        next_btn.pack(side="right")
+
+        # --- Строка с названиями дней недели ---
+        self.weekday_row = ctk.CTkFrame(self, fg_color="transparent")
+        self.weekday_row.pack(padx=15, pady=(5, 0))
+        for i, name in enumerate(DAY_NAMES):
+            lbl = ctk.CTkLabel(self.weekday_row, text=name, width=52,
+                                font=ctk.CTkFont(size=12), text_color="gray")
+            lbl.grid(row=0, column=i, padx=4, pady=2)
+
+        # --- Контейнер под сетку квадратиков (пересоздаётся при каждом refresh) ---
+        self.grid_container = ctk.CTkFrame(self, fg_color="transparent")
+        self.grid_container.pack(padx=15, pady=(0, 10))
+
+        # --- Легенда цветов ---
+        legend = ctk.CTkFrame(self, fg_color="transparent")
+        legend.pack(padx=15, pady=(0, 15), anchor="w")
+        ctk.CTkLabel(legend, text="Меньше", font=ctk.CTkFont(size=11), text_color="gray").pack(side="left")
+        for color in (COLOR_0, COLOR_25, COLOR_50, COLOR_75, COLOR_100):
+            box = ctk.CTkFrame(legend, width=16, height=16, fg_color=color, corner_radius=3)
+            box.pack(side="left", padx=3)
+        ctk.CTkLabel(legend, text="Больше", font=ctk.CTkFont(size=11), text_color="gray").pack(side="left")
+
+        self.refresh()
+
+    def prev_month(self):
+        y, m = self.app.cal_year, self.app.cal_month
+        m -= 1
+        if m == 0:
+            m, y = 12, y - 1
+        self.app.cal_year, self.app.cal_month = y, m
+        self.refresh()
+
+    def next_month(self):
+        y, m = self.app.cal_year, self.app.cal_month
+        m += 1
+        if m == 13:
+            m, y = 1, y + 1
+        self.app.cal_year, self.app.cal_month = y, m
+        self.refresh()
+
+    def refresh(self):
+        """Полностью перерисовывает сетку квадратиков для текущего месяца."""
+        for widget in self.grid_container.winfo_children():
+            widget.destroy()
+
+        year, month = self.app.cal_year, self.app.cal_month
+        self.title_label.configure(text=f"{MONTH_NAMES[month - 1]} {year}")
+
+        weeks = calendar.monthcalendar(year, month)  # список недель, 0 = день из соседнего месяца
+        today = date.today()
+
+        for week_idx, week in enumerate(weeks):
+            for day_idx, day_num in enumerate(week):
+                if day_num == 0:
+                    cell = DayCell(self.grid_container, None, COLOR_NO_TASKS, False, None)
+                else:
+                    current_date = date(year, month, day_num)
+                    date_key = current_date.isoformat()
+                    is_today = (current_date == today)
+
+                    if is_today:
+                        # Сегодняшний день считаем "вживую" по текущему списку дел
+                        total = len(self.app.tasks)
+                        done = sum(1 for t in self.app.tasks if t["done"])
+                    else:
+                        record = self.app.history.get(date_key)
+                        done, total = (record["done"], record["total"]) if record else (0, 0)
+
+                    if current_date > today:
+                        color = COLOR_NO_TASKS  # будущее — просто пусто
+                        tooltip = None
+                    else:
+                        color = ratio_to_color(done, total)
+                        percent = round((done / total) * 100) if total else 0
+                        tooltip = f"{current_date.strftime('%d.%m.%Y')}\nВыполнено: {done} из {total} ({percent}%)"
+
+                    cell = DayCell(self.grid_container, day_num, color, is_today, tooltip)
+
+                cell.grid(row=week_idx, column=day_idx, padx=4, pady=4)
+
+
+class App(ctk.CTk):
+    """Главное окно приложения."""
+
+    def __init__(self):
+        super().__init__()
+        self.title("Трекер ежедневных дел")
+
+        # Данные
+        self.tasks = []      # список дел на сегодня: [{id, name, done}, ...]
+        self.history = {}    # история по дням: {"2026-09-24": {"done":3,"total":5}, ...}
+        self.last_date = date.today().isoformat()
+
+        today = date.today()
+        self.cal_year, self.cal_month = today.year, today.month
+
+        self.load_data()
+        self.rollover_day_if_needed()
+
+        self.build_ui()
+        self.render_tasks()
+
+        # --- Полноэкранный режим ---
+        self.attributes("-fullscreen", True)
+        self.bind("<Escape>", self.exit_fullscreen)
+        self.bind("<F11>", self.toggle_fullscreen)
+
+        self.protocol("WM_DELETE_WINDOW", self.on_close)
+
+    # ----------------------------------------------------------------
+    # Полноэкранный режим
+    # ----------------------------------------------------------------
+    def exit_fullscreen(self, event=None):
+        self.attributes("-fullscreen", False)
+        self.geometry("1200x750")
+
+    def toggle_fullscreen(self, event=None):
+        is_full = self.attributes("-fullscreen")
+        self.attributes("-fullscreen", not is_full)
+
+    # ----------------------------------------------------------------
+    # Построение интерфейса
+    # ----------------------------------------------------------------
+    def build_ui(self):
+        self.grid_columnconfigure(0, weight=0, minsize=380)
+        self.grid_columnconfigure(1, weight=1)
+        self.grid_rowconfigure(0, weight=1)
+
+        # ===== ЛЕВАЯ ПАНЕЛЬ: список дел =====
+        left_panel = ctk.CTkFrame(self, corner_radius=0)
+        left_panel.grid(row=0, column=0, sticky="nsew")
+
+        top_bar = ctk.CTkFrame(left_panel, fg_color="transparent")
+        top_bar.pack(fill="x", padx=15, pady=(15, 5))
+        ctk.CTkLabel(
+            top_bar, text="Мои дела на сегодня",
+            font=ctk.CTkFont(size=20, weight="bold")
+        ).pack(side="left")
+        ctk.CTkButton(
+            top_bar, text="Выйти из полного экрана (Esc)", width=1,
+            fg_color="transparent", hover_color="#333333",
+            font=ctk.CTkFont(size=11), text_color="gray",
+            command=self.exit_fullscreen,
+        ).pack(side="right")
+
+        input_frame = ctk.CTkFrame(left_panel, fg_color="transparent")
+        input_frame.pack(fill="x", padx=15, pady=(0, 10))
+
+        self.entry = ctk.CTkEntry(
+            input_frame, placeholder_text="Введите новое дело...",
+            font=ctk.CTkFont(size=14)
+        )
+        self.entry.pack(side="left", fill="x", expand=True, padx=(0, 8), ipady=4)
+        self.entry.bind("<Return>", lambda event: self.add_task())
+
+        ctk.CTkButton(input_frame, text="Добавить", width=90, command=self.add_task).pack(side="right")
+
+        self.scroll_frame = ctk.CTkScrollableFrame(left_panel, label_text="Список дел")
+        self.scroll_frame.pack(fill="both", expand=True, padx=15, pady=(0, 10))
+
+        bottom_frame = ctk.CTkFrame(left_panel, fg_color="transparent")
+        bottom_frame.pack(fill="x", padx=15, pady=(0, 15))
+
+        self.progress_label = ctk.CTkLabel(bottom_frame, text="Выполнено: 0 / 0", font=ctk.CTkFont(size=13))
+        self.progress_label.pack(side="left")
+
+        ctk.CTkButton(
+            bottom_frame, text="🔄 Новый день / Сбросить отметки",
+            fg_color="#3a5f8a", hover_color="#4a75ab",
+            command=self.reset_day
+        ).pack(side="right")
+
+        # ===== ПРАВАЯ ПАНЕЛЬ: календарь активности =====
+        right_panel = ctk.CTkFrame(self, fg_color="#1a1a1a", corner_radius=0)
+        right_panel.grid(row=0, column=1, sticky="nsew", padx=(2, 0))
+        right_panel.grid_columnconfigure(0, weight=1)
+        right_panel.grid_rowconfigure(0, weight=1)
+
+        wrapper = ctk.CTkFrame(right_panel, fg_color="transparent")
+        wrapper.grid(row=0, column=0)
+
+        self.calendar_view = CalendarView(wrapper, self)
+        self.calendar_view.pack(padx=20, pady=20)
+
+    # ----------------------------------------------------------------
+    # Логика работы с задачами
+    # ----------------------------------------------------------------
+    def add_task(self):
+        name = self.entry.get().strip()
+        if not name:
+            return
+        self.tasks.append({"id": str(uuid.uuid4()), "name": name, "done": False})
+        self.entry.delete(0, "end")
+        self.render_tasks()
+        self.save_data()
+
+    def delete_task(self, task_id):
+        self.tasks = [t for t in self.tasks if t["id"] != task_id]
+        self.render_tasks()
+        self.save_data()
+
+    def set_task_done(self, task_id, is_done):
+        for t in self.tasks:
+            if t["id"] == task_id:
+                t["done"] = is_done
+                break
+        self.update_progress_label()
+        self.calendar_view.refresh()  # сегодняшний квадратик обновляется "вживую"
+        self.save_data()
+
+    def reset_day(self):
+        if not self.tasks:
+            return
+        if messagebox.askyesno("Новый день", "Сбросить все отметки о выполнении? Список дел останется."):
+            # Перед сбросом фиксируем сегодняшний результат в истории
+            self.archive_today()
+            for t in self.tasks:
+                t["done"] = False
+            self.render_tasks()
+            self.save_data()
+
+    # ----------------------------------------------------------------
+    # Работа с датами / историей
+    # ----------------------------------------------------------------
+    def archive_today(self):
+        """Сохраняет текущий результат дня (self.last_date) в историю."""
+        total = len(self.tasks)
+        done = sum(1 for t in self.tasks if t["done"])
+        self.history[self.last_date] = {"done": done, "total": total}
+
+    def rollover_day_if_needed(self):
+        """
+        Если приложение запущено в новый день (дата отличается от той,
+        что была сохранена в прошлый раз), архивируем прошлый день
+        и очищаем галочки для нового дня.
+        """
+        today_str = date.today().isoformat()
+        if self.last_date != today_str:
+            self.archive_today()
+            for t in self.tasks:
+                t["done"] = False
+            self.last_date = today_str
+            self.save_data()
+
+    # ----------------------------------------------------------------
+    # Отрисовка списка дел
+    # ----------------------------------------------------------------
+    def render_tasks(self):
+        for widget in self.scroll_frame.winfo_children():
+            widget.destroy()
+
+        if not self.tasks:
+            ctk.CTkLabel(
+                self.scroll_frame, text="Пока нет дел. Добавьте первое дело выше ↑",
+                text_color="gray"
+            ).pack(pady=20)
+        else:
+            for task in self.tasks:
+                TaskRow(self.scroll_frame, self, task).pack(fill="x", pady=4, padx=2)
+
+        self.update_progress_label()
+        if hasattr(self, "calendar_view"):
+            self.calendar_view.refresh()
+
+    def update_progress_label(self):
+        total = len(self.tasks)
+        done = sum(1 for t in self.tasks if t["done"])
+        self.progress_label.configure(text=f"Выполнено: {done} / {total}")
+
+    # ----------------------------------------------------------------
+    # Сохранение и загрузка данных
+    # ----------------------------------------------------------------
+    def save_data(self):
+        try:
+            payload = {
+                "tasks": self.tasks,
+                "history": self.history,
+                "last_date": self.last_date,
+            }
+            with open(DATA_FILE, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False, indent=2)
+        except OSError as e:
+            messagebox.showerror("Ошибка сохранения", str(e))
+
+    def load_data(self):
+        if os.path.exists(DATA_FILE):
+            try:
+                with open(DATA_FILE, "r", encoding="utf-8") as f:
+                    payload = json.load(f)
+                self.tasks = payload.get("tasks", [])
+                self.history = payload.get("history", {})
+                self.last_date = payload.get("last_date", date.today().isoformat())
+            except (json.JSONDecodeError, OSError):
+                self.tasks, self.history = [], {}
+        else:
+            self.tasks, self.history = [], {}
+
+    def on_close(self):
+        self.archive_today()
+        self.save_data()
+        self.destroy()
+
+
+if __name__ == "__main__":
+    app = App()
+    app.mainloop()
